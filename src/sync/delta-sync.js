@@ -203,11 +203,14 @@ export const deltaToPSteps = (tr, d, pnode = tr.doc, currPos = { i: 0 }) => {
   let nOffset = 0
   const pchildren = pnode.children
   for (const attr of d.attrs) {
-    // ProseMirror text nodes don't support attrs. Some collaborative
-    // delta paths can still surface attribute changes while recursing
-    // through a text child, so ignore those instead of crashing.
-    if (!pnode.isText) {
-      tr.setNodeAttribute(currPos.i - 1, attr.key, attr.value)
+    const nodePos = currPos.i - 1
+    const targetNode = nodePos >= 0 ? tr.doc.nodeAt(nodePos) : null
+    // ProseMirror text nodes don't support attrs, and collaborative
+    // undo/diff paths can still surface attribute changes for nodes that
+    // were already deleted or shifted away. Ignore those invalid attr
+    // applications instead of crashing mid-sync.
+    if (targetNode != null && !targetNode.isText) {
+      tr.setNodeAttribute(nodePos, attr.key, attr.value)
     }
   }
   d.children.forEach(op => {
