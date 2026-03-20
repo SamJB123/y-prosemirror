@@ -110,9 +110,6 @@ export function syncPlugin (ytype, {
   // Store the current subscription unsubscribe function
   /** @type {(() => void) | null} */
   let unsubscribeFn = null
-  // Tracks whether the initial hydration (setTimeout in view()) has completed.
-  // Prevents view.update from calling subscribeToYType prematurely.
-  let initCompleted = false
 
   /**
    * Subscribe to ytype changes and apply remote updates to prosemirror
@@ -131,6 +128,7 @@ export function syncPlugin (ytype, {
 
     // Track if ytype has been initialized
     let isYTypeInitialized = !!ytype.length
+
     const yTypeCb = ytype.observeDeep((change, tr) => {
       if (!view || view.isDestroyed) {
         // View is destroyed, clean up
@@ -153,40 +151,17 @@ export function syncPlugin (ytype, {
       }
 
       mutex(() => {
-        let d
+        let d = deltaAttributionToFormat(
+          change.getDelta(attributionManager, { deep: true }),
+          mapAttributionToMark
+        ).done()
+
         if (!isYTypeInitialized) {
-          // First remote update before init completed: diff the full Y.Type
-          // content against the current PM doc, not the incremental event delta
-          // (event deltas contain ModifyOps which are structurally incompatible
-          // with the full-doc InsertOps that nodeToDelta produces).
-          const ytypeContent = deltaAttributionToFormat(
-            ytype.toDelta(attributionManager, { deep: true }),
-            mapAttributionToMark
-          ).done()
-          d = delta.diff(nodeToDelta(view.state.doc).done(), ytypeContent)
-        } else {
-          d = deltaAttributionToFormat(
-            change.getDelta(attributionManager, { deep: true }),
-            mapAttributionToMark
-          ).done()
+          // First update: need to diff with current prosemirror doc to avoid duplication
+          d = delta.diff(nodeToDelta(view.state.doc).done(), d)
         }
 
-        let ptr = deltaToPSteps(view.state.tr, d)
-
-        // DiffAttributionManager.contentLength returns 0 for deleted items
-        // without suggestion attrs, making the incremental event delta blind
-        // to deletions propagated from the base doc (e.g. undo via applyUpdate).
-        // For non-local transactions with an attribution manager, fall back to
-        // a full doc diff which compares rendered content directly.
-        if (ptr.steps.length === 0 && isYTypeInitialized && !tr.local && attributionManager !== Y.noAttributionsManager) {
-          const ytypeContent = deltaAttributionToFormat(
-            ytype.toDelta(attributionManager, { deep: true }),
-            mapAttributionToMark
-          ).done()
-          const fullDiff = delta.diff(nodeToDelta(view.state.doc).done(), ytypeContent)
-          ptr = deltaToPSteps(view.state.tr, fullDiff)
-        }
-
+        const ptr = deltaToPSteps(view.state.tr, d)
         ptr.setMeta(ySyncPluginKey, {
           type: 'remote-update',
           change,
@@ -255,11 +230,8 @@ export function syncPlugin (ytype, {
           ) !== null
 
           if (pmHasContent) {
-            // Apply prosemirror content to ytype.
-            // Mark as non-undoable so the UndoManager doesn't capture the
-            // initial document structure (undoing it would destroy everything).
-            ytype.doc.transact((tr) => {
-              tr.meta.set('addToHistory', false)
+            // Apply prosemirror content to ytype
+            ytype.doc.transact(() => {
               pmToFragment(view.state.doc, ytype, { attributionManager })
             }, ySyncPluginKey)
           }
@@ -353,28 +325,21 @@ export function syncPlugin (ytype, {
                   deltaToApply = trToDelta(transform)
                 }
 
-                const allAddToHistory = captured.every(
-                  pmTr => pmTr.getMeta('addToHistory') !== false
-                )
-
-                // Seed the previous ProseMirror state separately and without
-                // history. If we combine this bootstrap with the user's first
-                // edit, undo can end up owning the structural parent items and
-                // remove later remote edits nested under them.
-                if (pluginState.ytype.length === 0) {
-                  pluginState.ytype.doc.transact((tr) => {
-                    tr.meta.set('addToHistory', false)
-                    pmToFragment(prevState.doc, pluginState.ytype, {
-                      attributionManager: pluginState.attributionManager
-                    })
-                  }, ySyncPluginKey)
-                }
-
-                // Apply the actual user edit as the undoable transaction.
+                // Apply delta to ytype
                 pluginState.ytype.doc.transact((tr) => {
                   // Bridge addToHistory from PM transactions to the Yjs transaction
                   // so the UndoManager's captureTransaction can respect it
+                  const allAddToHistory = captured.every(
+                    pmTr => pmTr.getMeta('addToHistory') !== false
+                  )
                   tr.meta.set('addToHistory', allAddToHistory)
+
+                  // If ytype has not yet been initialized, apply the previous prosemirror document first
+                  if (pluginState.ytype.length === 0) {
+                    pmToFragment(prevState.doc, pluginState.ytype, {
+                      attributionManager: pluginState.attributionManager
+                    })
+                  }
                   pluginState.ytype.applyDelta(deltaToApply, pluginState.attributionManager)
                 }, ySyncPluginKey)
 

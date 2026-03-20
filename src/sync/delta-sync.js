@@ -16,7 +16,7 @@ import {
   ReplaceStep
 } from 'prosemirror-transform'
 
-export const $prosemirrorDelta = delta.$delta({ name: s.$string, attrs: s.$record(s.$union(s.$string, s.$number), s.$any), text: true, recursiveChildren: true })
+export const $prosemirrorDelta = delta.$delta({ name: s.$string, attrs: s.$record(s.$string, s.$any), text: true, recursiveChildren: true })
 
 /**
  * @typedef {s.Unwrap<typeof $prosemirrorDelta>} ProsemirrorDelta
@@ -333,16 +333,10 @@ export const trToDelta = (tr) => {
   // Calculate delta from initial and final document states to avoid composition issues with delete operations
   // This is more reliable than composing step-by-step, which can lose delete operations and cause "Unexpected case" errors
   // after lib0 upgrades that change delta composition behavior
-  const initialDelta = nodeToDelta(tr.before).done()
-  const finalDelta = nodeToDelta(tr.doc).done()
-  try {
-    return delta.diff(initialDelta, finalDelta)
-  } catch (e) {
-    console.error('[y-prosemirror trToDelta] delta.diff crashed')
-    console.error('initial:', JSON.stringify(initialDelta.toJSON(), null, 2))
-    console.error('final:', JSON.stringify(finalDelta.toJSON(), null, 2))
-    throw e
-  }
+  const initialDelta = nodeToDelta(tr.before)
+  const finalDelta = nodeToDelta(tr.doc)
+  const resultDelta = delta.diff(initialDelta.done(), finalDelta.done())
+  return resultDelta
 }
 
 const _stepToDelta = s.match({ beforeDoc: Node, afterDoc: Node })
