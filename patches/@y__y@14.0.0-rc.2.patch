@@ -1,0 +1,41 @@
+diff --git a/src/utils/AttributionManager.js b/src/utils/AttributionManager.js
+index d7500fc8df389e8fde1926e87e1365fe9db8801a..af7e333f7c47cd861d80d65028d5bcbd543b3adf 100644
+--- a/src/utils/AttributionManager.js
++++ b/src/utils/AttributionManager.js
+@@ -514,6 +514,14 @@ export class DiffAttributionManager extends ObservableV2 {
+    */
+   readContent (contents, client, clock, deleted, _content, shouldRender) {
+     const slice = (deleted ? this.deletes : this.inserts).slice(client, clock, _content.getLength())
++    // When the event system flags an item as changed (shouldRender=2) but the
++    // attribution tracker has no record of it (empty slice), render it directly.
++    // This happens for deletions propagated from the base doc (e.g. undo via
++    // applyUpdate) that aren't part of the suggestion diff.
++    if (slice.length === 0 && shouldRender === 2) {
++      contents.push(new AttributedContent(_content, clock, deleted, null, shouldRender))
++      return
++    }
+     /**
+      * @type {AbstractContent?}
+      */
+diff --git a/src/utils/YEvent.js b/src/utils/YEvent.js
+index 8348c313d444792177a45fb5aecaffb0e1f24612..affe53a72a616262badc9b205a6d3c60f22b2e6d 100644
+--- a/src/utils/YEvent.js
++++ b/src/utils/YEvent.js
+@@ -99,7 +99,16 @@ export class YEvent {
+    * @public
+    */
+   getDelta (am = noAttributionsManager, { deep } = {}) {
+-    const itemsToRender = mergeIdSets([diffIdSet(this.transaction.insertSet, this.transaction.deleteSet), diffIdSet(this.transaction.deleteSet, this.transaction.insertSet)])
++    // Symmetric diff: items that were ONLY inserted or ONLY deleted in this
++    // transaction get shouldRender=2 (visible change).  Items in BOTH sets
++    // (created-and-immediately-deleted) are excluded for local transactions
++    // because they never visibly existed.  For non-local transactions (e.g.
++    // applyUpdate propagating an undo), items can appear in both sets due to
++    // item splitting during integration — the deletion IS real and must be
++    // rendered, so we use the full deleteSet instead of the symmetric diff.
++    const itemsToRender = this.transaction.local
++      ? mergeIdSets([diffIdSet(this.transaction.insertSet, this.transaction.deleteSet), diffIdSet(this.transaction.deleteSet, this.transaction.insertSet)])
++      : mergeIdSets([diffIdSet(this.transaction.insertSet, this.transaction.deleteSet), this.transaction.deleteSet])
+     /**
+      * @todo this should be done only one in the transaction step
+      *

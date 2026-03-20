@@ -92,6 +92,79 @@ function apply (tr, prevPluginState) {
 }
 
 /**
+ * Build the delta that should be applied for a group of captured PM transactions.
+ *
+ * @param {Array<import('prosemirror-state').Transaction>} captured
+ */
+const capturedTransactionsToDelta = captured => {
+  const transform = new Transform(captured[0].before)
+  let stepFailed = false
+
+  for (let i = 0; i < captured.length; i++) {
+    for (let j = 0; j < captured[i].steps.length; j++) {
+      const success = transform.maybeStep(captured[i].steps[j])
+      if (success.failed) {
+        stepFailed = true
+        break
+      }
+    }
+    if (stepFailed) break
+  }
+
+  if (stepFailed) {
+    console.error('[y/prosemirror]: step failed to apply, falling back to a full diff')
+    return docDiffToDelta(captured[0].before, captured[captured.length - 1].after)
+  }
+
+  return trToDelta(transform)
+}
+
+/**
+ * Group captured transactions by consecutive addToHistory intent.
+ *
+ * @param {Array<import('prosemirror-state').Transaction>} captured
+ */
+const groupCapturedTransactions = captured => {
+  /**
+   * @type {Array<{ captured: Array<import('prosemirror-state').Transaction>, addToHistory: boolean }>}
+   */
+  const groups = []
+  /** @type {Array<import('prosemirror-state').Transaction>} */
+  let currentGroup = []
+  let currentAddToHistory = true
+
+  captured.forEach((pmTr, index) => {
+    const addToHistory = pmTr.getMeta('addToHistory') !== false
+    if (index === 0) {
+      currentGroup = [pmTr]
+      currentAddToHistory = addToHistory
+      return
+    }
+
+    if (addToHistory === currentAddToHistory) {
+      currentGroup.push(pmTr)
+      return
+    }
+
+    groups.push({
+      captured: currentGroup,
+      addToHistory: currentAddToHistory
+    })
+    currentGroup = [pmTr]
+    currentAddToHistory = addToHistory
+  })
+
+  if (currentGroup.length > 0) {
+    groups.push({
+      captured: currentGroup,
+      addToHistory: currentAddToHistory
+    })
+  }
+
+  return groups
+}
+
+/**
  * This Prosemirror {@link Plugin} is responsible for synchronizing the prosemirror {@link EditorState} with a {@link Y.XmlFragment}
  * @param {Y.Type} ytype
  * @param {object} opts
@@ -151,17 +224,40 @@ export function syncPlugin (ytype, {
       }
 
       mutex(() => {
-        let d = deltaAttributionToFormat(
-          change.getDelta(attributionManager, { deep: true }),
-          mapAttributionToMark
-        ).done()
-
+        let d
         if (!isYTypeInitialized) {
-          // First update: need to diff with current prosemirror doc to avoid duplication
-          d = delta.diff(nodeToDelta(view.state.doc).done(), d)
+          // First remote update before init completed: diff the full Y.Type
+          // content against the current PM doc, not the incremental event delta
+          // (event deltas contain ModifyOps which are structurally incompatible
+          // with the full-doc InsertOps that nodeToDelta produces).
+          const ytypeContent = deltaAttributionToFormat(
+            ytype.toDelta(attributionManager, { deep: true }),
+            mapAttributionToMark
+          ).done()
+          d = delta.diff(nodeToDelta(view.state.doc).done(), ytypeContent)
+        } else {
+          d = deltaAttributionToFormat(
+            change.getDelta(attributionManager, { deep: true }),
+            mapAttributionToMark
+          ).done()
         }
 
-        const ptr = deltaToPSteps(view.state.tr, d)
+        let ptr = deltaToPSteps(view.state.tr, d)
+
+        // DiffAttributionManager.contentLength returns 0 for deleted items
+        // without suggestion attrs, making the incremental event delta blind
+        // to deletions propagated from the base doc (e.g. undo via applyUpdate).
+        // For non-local transactions with an attribution manager, fall back to
+        // a full doc diff which compares rendered content directly.
+        if (ptr.steps.length === 0 && isYTypeInitialized && !tr.local && attributionManager !== Y.noAttributionsManager) {
+          const ytypeContent = deltaAttributionToFormat(
+            ytype.toDelta(attributionManager, { deep: true }),
+            mapAttributionToMark
+          ).done()
+          const fullDiff = delta.diff(nodeToDelta(view.state.doc).done(), ytypeContent)
+          ptr = deltaToPSteps(view.state.tr, fullDiff)
+        }
+
         ptr.setMeta(ySyncPluginKey, {
           type: 'remote-update',
           change,
@@ -230,8 +326,11 @@ export function syncPlugin (ytype, {
           ) !== null
 
           if (pmHasContent) {
-            // Apply prosemirror content to ytype
-            ytype.doc.transact(() => {
+            // Apply prosemirror content to ytype.
+            // Mark as non-undoable so the UndoManager doesn't capture the
+            // initial document structure (undoing it would destroy everything).
+            ytype.doc.transact((tr) => {
+              tr.meta.set('addToHistory', false)
               pmToFragment(view.state.doc, ytype, { attributionManager })
             }, ySyncPluginKey)
           }
@@ -298,50 +397,37 @@ export function syncPlugin (ytype, {
             // Process captured transactions and apply to ytype
             if (pluginState.capturedTransactions.length > 0) {
               mutex(() => {
-                const captured = pluginState.capturedTransactions
+                const capturedGroups = groupCapturedTransactions(pluginState.capturedTransactions)
 
-                // Build Transform from captured transactions
-                const transform = new Transform(captured[0].before)
-                let stepFailed = false
-
-                for (let i = 0; i < captured.length; i++) {
-                  for (let j = 0; j < captured[i].steps.length; j++) {
-                    const success = transform.maybeStep(captured[i].steps[j])
-                    if (success.failed) {
-                      stepFailed = true
-                      break
-                    }
-                  }
-                  if (stepFailed) break
-                }
-
-                let deltaToApply
-                if (stepFailed) {
-                  // Fallback to full diff
-                  console.error('[y/prosemirror]: step failed to apply, falling back to a full diff')
-                  deltaToApply = docDiffToDelta(captured[0].before, captured[captured.length - 1].after)
-                } else {
-                  // Convert transform to delta
-                  deltaToApply = trToDelta(transform)
-                }
-
-                // Apply delta to ytype
-                pluginState.ytype.doc.transact((tr) => {
-                  // Bridge addToHistory from PM transactions to the Yjs transaction
-                  // so the UndoManager's captureTransaction can respect it
-                  const allAddToHistory = captured.every(
-                    pmTr => pmTr.getMeta('addToHistory') !== false
-                  )
-                  tr.meta.set('addToHistory', allAddToHistory)
-
-                  // If ytype has not yet been initialized, apply the previous prosemirror document first
-                  if (pluginState.ytype.length === 0) {
+                // Seed the previous ProseMirror state separately and without
+                // history. If we combine this bootstrap with the user's first
+                // edit, undo can end up owning the structural parent items and
+                // remove later remote edits nested under them.
+                if (pluginState.ytype.length === 0) {
+                  pluginState.ytype.doc.transact((tr) => {
+                    tr.meta.set('addToHistory', false)
                     pmToFragment(prevState.doc, pluginState.ytype, {
                       attributionManager: pluginState.attributionManager
                     })
-                  }
-                  pluginState.ytype.applyDelta(deltaToApply, pluginState.attributionManager)
-                }, ySyncPluginKey)
+                  }, ySyncPluginKey)
+                }
+
+                capturedGroups.forEach(({ captured, addToHistory }) => {
+                  const deltaToApply = capturedTransactionsToDelta(captured)
+
+                  // Transactions that originated from remote Y.Doc updates
+                  // (observeDeep -> PM dispatch) should remain non-local when
+                  // written back to the Y.Doc so the UndoManager does not
+                  // capture them on suggestion/mirror editors.
+                  const isLocal = !captured.some(
+                    pmTr => pmTr.getMeta(ySyncPluginKey)?.type === 'remote-update'
+                  )
+
+                  Y.transact(pluginState.ytype.doc, (tr) => {
+                    tr.meta.set('addToHistory', addToHistory)
+                    pluginState.ytype.applyDelta(deltaToApply, pluginState.attributionManager)
+                  }, ySyncPluginKey, isLocal)
+                })
 
                 pluginState.capturedTransactions = []
               })

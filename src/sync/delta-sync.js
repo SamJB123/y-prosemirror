@@ -203,7 +203,12 @@ export const deltaToPSteps = (tr, d, pnode = tr.doc, currPos = { i: 0 }) => {
   let nOffset = 0
   const pchildren = pnode.children
   for (const attr of d.attrs) {
-    tr.setNodeAttribute(currPos.i - 1, attr.key, attr.value)
+    // ProseMirror text nodes don't support attrs. Some collaborative
+    // delta paths can still surface attribute changes while recursing
+    // through a text child, so ignore those instead of crashing.
+    if (!pnode.isText) {
+      tr.setNodeAttribute(currPos.i - 1, attr.key, attr.value)
+    }
   }
   d.children.forEach(op => {
     if (delta.$retainOp.check(op)) {
