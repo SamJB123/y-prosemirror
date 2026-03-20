@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(xargs grep:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(find C:/Users/sambi/Github/BlockNote/node_modules/.pnpm -path *@y*prosemirror* -name undo*)",
+      "Bash(find C:/Users/sambi/Github/BlockNote/node_modules/.pnpm -path *@y*prosemirror* -name keys.js)",
+      "Bash(node -e \":*)",
+      "Bash(find C:/Users/sambi/Github/BlockNote/node_modules/.pnpm -path *@y+y* -name package.json -maxdepth 5)"
     ]
   }
 }

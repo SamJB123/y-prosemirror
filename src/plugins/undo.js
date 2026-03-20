@@ -33,7 +33,12 @@ function getRelativeSelection (ytype, state, am) {
  * @param {import('prosemirror-state').EditorState} state
  * @return {boolean}
  */
-export const undo = state => yUndoPluginKey.getState(state)?.undoManager?.undo() != null
+export const undo = state => {
+  const pluginState = yUndoPluginKey.getState(state)
+  const um = pluginState?.undoManager
+  const result = um?.undo()
+  return result != null
+}
 
 /**
  * @param {import('prosemirror-state').EditorState} state
@@ -139,23 +144,39 @@ export const yUndoPlugin = ({
       const _undoManager = undoState?.undoManager
       if (!_undoManager) return { destroy () {} }
 
-      _undoManager.on('stack-item-added', ({ stackItem }) => {
+      // If the UndoManager was previously destroyed (e.g., by React strict mode
+      // unmounting and remounting the view), re-register its handler.
+      if (!_undoManager.trackedOrigins.has(_undoManager)) {
+        _undoManager.trackedOrigins.add(_undoManager)
+        _undoManager.doc.on('afterTransaction', _undoManager.afterTransactionHandler)
+      }
+
+      /** @param {{ stackItem: InstanceType<typeof import('@y/y').StackItem> }} event */
+      const onStackItemAdded = ({ stackItem }) => {
         const prevSel = yUndoPluginKey.getState(view.state)?.prevSel
         if (prevSel) {
           stackItem.meta.set('relative-selection', prevSel)
         }
-      })
+      }
 
-      _undoManager.on('stack-item-popped', ({ stackItem }) => {
+      /** @param {{ stackItem: InstanceType<typeof import('@y/y').StackItem> }} event */
+      const onStackItemPopped = ({ stackItem }) => {
         const sel = stackItem.meta.get('relative-selection')
         if (sel) {
           pendingSelection = sel
         }
-      })
+      }
+
+      _undoManager.on('stack-item-added', onStackItemAdded)
+      _undoManager.on('stack-item-popped', onStackItemPopped)
 
       return {
         destroy () {
-          _undoManager.destroy()
+          _undoManager.off('stack-item-added', onStackItemAdded)
+          _undoManager.off('stack-item-popped', onStackItemPopped)
+          // Don't destroy the UndoManager — it's owned by the plugin state
+          // and may be reused if the view is remounted (e.g., React strict mode).
+          // It self-destructs via doc.on('destroy') registered in its constructor.
         }
       }
     },
@@ -183,17 +204,23 @@ export const yUndoPlugin = ({
       )
       pendingSelection = null
 
+      let sel = null
       if (anchor != null && head != null) {
         try {
-          const sel = TextSelection.create(newState.doc, anchor, head)
-          const tr = newState.tr.setSelection(sel)
-          tr.setMeta('addToHistory', false)
-          return tr
+          sel = TextSelection.create(newState.doc, anchor, head)
         } catch {
-          return null
+          // Position resolved to a non-inline node (e.g. blockContainer
+          // kept by deleteFilter). Fall through to the fallback below.
         }
       }
-      return null
+      // Guarantee a valid cursor position — TextSelection.atStart always
+      // finds the first text-containing node in the document.
+      if (!sel) {
+        sel = TextSelection.atStart(newState.doc)
+      }
+      const tr = newState.tr.setSelection(sel)
+      tr.setMeta('addToHistory', false)
+      return tr
     }
   })
 }
