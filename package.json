@@ -5,15 +5,15 @@
   "main": "./dist/y-prosemirror.cjs",
   "module": "./src/y-prosemirror.js",
   "type": "module",
-  "types": "./dist/src/y-prosemirror.d.ts",
+  "types": "./dist/src/index.d.ts",
   "sideEffects": false,
   "funding": {
     "type": "GitHub Sponsors ❤",
     "url": "https://github.com/sponsors/dmonad"
   },
   "scripts": {
-    "clean": "rm -rf dist",
-    "dist": "npm run clean && rollup -c && (tsc --skipLibCheck || true)",
+    "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\"",
+    "dist": "npm run clean && rollup -c && node -e \"try{require('child_process').execSync('tsc --skipLibCheck',{stdio:'inherit'})}catch{}\"",
     "test": "node ./tests/index.node.js",
     "lint": "standard && tsc --skipLibCheck",
     "watch": "rollup -wc",
@@ -23,7 +23,7 @@
   },
   "exports": {
     ".": {
-      "types": "./dist/src/y-prosemirror.d.ts",
+      "types": "./dist/src/index.d.ts",
       "import": "./src/index.js",
       "require": "./dist/y-prosemirror.cjs"
     }
