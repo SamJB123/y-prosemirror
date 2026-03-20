@@ -326,7 +326,14 @@ export function syncPlugin (ytype, {
                 }
 
                 // Apply delta to ytype
-                pluginState.ytype.doc.transact(() => {
+                pluginState.ytype.doc.transact((tr) => {
+                  // Bridge addToHistory from PM transactions to the Yjs transaction
+                  // so the UndoManager's captureTransaction can respect it
+                  const allAddToHistory = captured.every(
+                    pmTr => pmTr.getMeta('addToHistory') !== false
+                  )
+                  tr.meta.set('addToHistory', allAddToHistory)
+
                   // If ytype has not yet been initialized, apply the previous prosemirror document first
                   if (pluginState.ytype.length === 0) {
                     pmToFragment(prevState.doc, pluginState.ytype, {
