@@ -56,6 +56,22 @@ export const redoCommand = (state, dispatch) =>
 export const defaultProtectedNodes = new Set(['paragraph'])
 
 /**
+ * @param {import('prosemirror-model').Node} doc
+ * @param {number} pos
+ * @returns {boolean}
+ */
+const isInlineSelectionPosition = (doc, pos) => {
+  if (typeof pos !== 'number' || pos < 0 || pos > doc.content.size) {
+    return false
+  }
+  try {
+    return doc.resolve(pos).parent.inlineContent
+  } catch {
+    return false
+  }
+}
+
+/**
  * @param {Item} item
  * @param {Set<string>} protectedNodes
  * @returns {boolean}
@@ -200,7 +216,12 @@ export const yUndoPlugin = ({
       pendingSelection = null
 
       let sel = null
-      if (anchor != null && head != null) {
+      if (
+        anchor != null &&
+        head != null &&
+        isInlineSelectionPosition(newState.doc, anchor) &&
+        isInlineSelectionPosition(newState.doc, head)
+      ) {
         try {
           sel = TextSelection.create(newState.doc, anchor, head)
         } catch {

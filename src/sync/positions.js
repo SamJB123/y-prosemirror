@@ -55,6 +55,13 @@ export const relativePositionToAbsolutePosition = (relPos, documentType, pmDoc, 
   // Traverse the path to find the nested position
   for (let i = 0; i < path.length; i++) {
     const childIndex = path[i]
+    if (
+      typeof childIndex !== 'number' ||
+      childIndex < 0 ||
+      childIndex >= currentNode.childCount
+    ) {
+      return null
+    }
     // Add sizes of all previous siblings
     for (let j = 0; j < childIndex; j++) {
       pos += currentNode.child(j).nodeSize
@@ -64,7 +71,8 @@ export const relativePositionToAbsolutePosition = (relPos, documentType, pmDoc, 
     currentNode = currentNode.child(childIndex)
   }
   // Add the offset within the target node
-  return pos + decodedPos.index
+  const absolutePos = pos + decodedPos.index
+  return absolutePos <= pmDoc.content.size + 1 ? absolutePos : null
 }
 
 /**

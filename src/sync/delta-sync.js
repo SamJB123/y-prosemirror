@@ -29,25 +29,32 @@ export const $prosemirrorDelta = delta.$delta({ name: s.$string, attrs: s.$recor
  * @returns {Record<string, unknown> | null}
  */
 export const defaultMapAttributionToMark = (format, attribution) => {
+  const hasInsertAttribution = Array.isArray(attribution.insert)
+    ? attribution.insert.length > 0
+    : !!attribution.insert
+  const hasDeleteAttribution = Array.isArray(attribution.delete)
+    ? attribution.delete.length > 0
+    : !!attribution.delete
+  const hasFormatAttribution = attribution.format != null && Object.keys(attribution.format).length > 0
   /**
    * @type {Record<string, unknown> | null}
    */
   let mergeWith = null
-  if (attribution.insert) {
+  if (hasInsertAttribution) {
     mergeWith = {
       'y-attribution-insertion': {
         userIds: attribution.insert ? attribution.insert : null,
         timestamp: attribution.insertAt ? attribution.insertAt : null
       }
     }
-  } else if (attribution.delete) {
+  } else if (hasDeleteAttribution) {
     mergeWith = {
       'y-attribution-deletion': {
         userIds: attribution.delete ? attribution.delete : null,
         timestamp: attribution.deleteAt ? attribution.deleteAt : null
       }
     }
-  } else if (attribution.format) {
+  } else if (hasFormatAttribution) {
     mergeWith = {
       'y-attribution-format': {
         userIdsByAttr: attribution.format ? attribution.format : null,
@@ -355,6 +362,9 @@ const syncElementAttrs = (yelement, pnode, attributionManager) => {
   Object.keys(pnode.attrs).forEach(key => {
     if (key === 'ychange') return
     const value = pnode.attrs[key]
+    if (key === 'id' && value == null) {
+      return
+    }
     if (value == null) {
       if (yattrs[key] !== undefined) {
         d.deleteAttr(key)
@@ -368,6 +378,9 @@ const syncElementAttrs = (yelement, pnode, attributionManager) => {
     }
   })
   Object.keys(yattrs).forEach(key => {
+    if (key === 'id') {
+      return
+    }
     if (pnode.attrs[key] === undefined) {
       d.deleteAttr(key)
       changed = true
@@ -644,6 +657,49 @@ export const deltaToPSteps = (tr, d, pnode = tr.doc, currPos = { i: 0 }) => {
   let currParentIndex = 0
   let nOffset = 0
   const pchildren = pnode.children
+  const advanceRetain = (retainLen, format = null) => {
+    let i = retainLen
+    while (i > 0) {
+      const pc = pchildren[currParentIndex]
+      if (pc === undefined) {
+        throw new Error('[y/prosemirror]: retain operation is out of bounds')
+      }
+      if (pc.isText) {
+        if (format != null) {
+          const from = currPos.i
+          const to = currPos.i + math.min(pc.nodeSize - nOffset, i)
+          object.forEach(format, (v, k) => {
+            if (v == null) {
+              tr.removeMark(from, to, schema.marks[k])
+            } else {
+              tr.addMark(from, to, schema.mark(k, v))
+            }
+          })
+        }
+        if (i + nOffset < pc.nodeSize) {
+          nOffset += i
+          currPos.i += i
+          i = 0
+        } else {
+          currParentIndex++
+          i -= pc.nodeSize - nOffset
+          currPos.i += pc.nodeSize - nOffset
+          nOffset = 0
+        }
+      } else {
+        object.forEach(format ?? {}, (v, k) => {
+          if (v == null) {
+            tr.removeNodeMark(currPos.i, schema.marks[k])
+          } else {
+            tr.addNodeMark(currPos.i, schema.mark(k, v))
+          }
+        })
+        currParentIndex++
+        currPos.i += pc.nodeSize
+        i--
+      }
+    }
+  }
   for (const attr of normalizeDeltaAttrs(d.attrs)) {
     const nodePos = currPos.i - 1
     const targetNode = nodePos >= 0 ? tr.doc.nodeAt(nodePos) : null
@@ -651,7 +707,12 @@ export const deltaToPSteps = (tr, d, pnode = tr.doc, currPos = { i: 0 }) => {
     // undo/diff paths can still surface attribute changes for nodes that
     // were already deleted or shifted away. Ignore those invalid attr
     // applications instead of crashing mid-sync.
-    if (getAttrOpType(attr) === 'set' && targetNode != null && !targetNode.isText) {
+    if (
+      getAttrOpType(attr) === 'set' &&
+      targetNode != null &&
+      !targetNode.isText &&
+      !(attr.key === 'id' && attr.value == null)
+    ) {
       tr.setNodeAttribute(nodePos, attr.key, attr.value)
     }
   }
@@ -661,6 +722,8 @@ export const deltaToPSteps = (tr, d, pnode = tr.doc, currPos = { i: 0 }) => {
     const opType = getChildOpType(op)
     const nextOp = children[opIndex + 1]
     const nextOpType = getChildOpType(nextOp)
+    const nextNextOp = children[opIndex + 2]
+    const nextNextOpType = getChildOpType(nextNextOp)
     if (
       opType === 'delete' &&
       nextOpType === 'insert' &&
@@ -676,54 +739,50 @@ export const deltaToPSteps = (tr, d, pnode = tr.doc, currPos = { i: 0 }) => {
         continue
       }
     }
-    if (opType === 'retain') {
-      // skip over i children
-      let i = op.retain
-      while (i > 0) {
-        const pc = pchildren[currParentIndex]
-        if (pc === undefined) {
-          throw new Error('[y/prosemirror]: retain operation is out of bounds')
-        }
-        if (pc.isText) {
-          if (op.format != null) {
-            const from = currPos.i
-            const to = currPos.i + math.min(pc.nodeSize - nOffset, i)
-            object.forEach(op.format, (v, k) => {
-              if (v == null) {
-                tr.removeMark(from, to, schema.marks[k])
-              } else {
-                tr.addMark(from, to, schema.mark(k, v))
-              }
-            })
-          }
-          if (i + nOffset < pc.nodeSize) {
-            nOffset += i
-            currPos.i += i
-            i = 0
-          } else {
-            currParentIndex++
-            i -= pc.nodeSize - nOffset
-            currPos.i += pc.nodeSize - nOffset
-            nOffset = 0
-          }
-        } else {
-          object.forEach(op.format ?? {}, (v, k) => {
-            if (v == null) {
-              tr.removeNodeMark(currPos.i, schema.marks[k])
-            } else {
-              // TODO see schema.js for more info on marking nodes
-              tr.addNodeMark(currPos.i, schema.mark(k, v))
-            }
-          })
-          currParentIndex++
-          currPos.i += pc.nodeSize
-          i--
-        }
+    if (
+      opType === 'insert' &&
+      nextOpType === 'delete' &&
+      nextOp.delete === 1
+    ) {
+      const pc = pchildren[currParentIndex]
+      if (pc !== undefined && !pc.isText) {
+        const newPChildren = op.insert.map(ins => deltaToPNode(ins, schema, op.format))
+        tr.replaceWith(currPos.i, currPos.i + pc.nodeSize, newPChildren)
+        currParentIndex++
+        currPos.i += newPChildren.reduce((s, c) => c.nodeSize + s, 0)
+        opIndex++
+        continue
       }
+    }
+    if (
+      opType === 'delete' &&
+      nextOpType === 'retain' &&
+      nextNextOpType === 'delete' &&
+      op.delete === 1 &&
+      nextNextOp.delete === 1
+    ) {
+      const pc = pchildren[currParentIndex]
+      if (pc !== undefined && pc.isText && pc.marks.length > 0) {
+        const from = currPos.i
+        const to = currPos.i + nextOp.retain
+        pc.marks.forEach(mark => {
+          tr.removeMark(from, to, mark.type)
+        })
+        advanceRetain(nextOp.retain)
+        opIndex += 2
+        continue
+      }
+    }
+    if (opType === 'retain') {
+      advanceRetain(op.retain, op.format ?? null)
     } else if (opType === 'modify') {
-      currPos.i++
-      deltaToPSteps(tr, op.value, pchildren[currParentIndex++], currPos)
-      currPos.i++
+      const childIndex = currParentIndex++
+      const pc = pchildren[childIndex]
+      const childStart = currPos.i
+      currPos.i = childStart + 1
+      deltaToPSteps(tr, op.value, pc, currPos)
+      const updatedChild = tr.doc.nodeAt(childStart)
+      currPos.i = childStart + (updatedChild?.nodeSize ?? pc.nodeSize)
     } else if (opType === 'insert') {
       const newPChildren = op.insert.map(ins => deltaToPNode(ins, schema, op.format))
       tr.insert(currPos.i, newPChildren)
