@@ -3,16 +3,14 @@ import * as delta from 'lib0/delta'
 import * as error from 'lib0/error'
 import * as mux from 'lib0/mutex'
 import { Plugin } from 'prosemirror-state'
-import { Transform } from 'prosemirror-transform'
 import {
   defaultMapAttributionToMark,
   deltaAttributionToFormat,
   deltaToPSteps,
-  docDiffToDelta,
   fragmentToTr,
-  nodeToDelta,
   pmToFragment,
-  trToDelta
+  nodeToDelta,
+  syncStructuralChangesToYFragment
 } from '../../sync/index.js'
 import { ySyncPluginKey } from '../keys.js'
 
@@ -23,12 +21,29 @@ import { ySyncPluginKey } from '../keys.js'
 
 // This is a pure function of the transaction and the previous plugin state
 /** @type {import('prosemirror-state').StateField<SyncPluginState>['apply']} */
+const transactionOriginatesFromRemoteUpdate = tr => {
+  let current = tr
+  while (current) {
+    const syncMeta = current.getMeta(ySyncPluginKey)
+    if (syncMeta?.type === 'remote-update') {
+      return true
+    }
+    current = current.getMeta('appendedTransaction')
+  }
+  return false
+}
+
 function apply (tr, prevPluginState) {
   /** @type {SyncPluginTransactionMeta | undefined} */
   const trMeta = tr.getMeta(ySyncPluginKey)
 
   // Capture document-changing transactions (only in synced mode, and not sync plugin meta transactions)
-  if (tr.docChanged && !trMeta && prevPluginState.type === 'synced') {
+  if (
+    tr.docChanged &&
+    !trMeta &&
+    prevPluginState.type === 'synced' &&
+    !transactionOriginatesFromRemoteUpdate(tr)
+  ) {
     return {
       ...prevPluginState,
       capturedTransactions: prevPluginState.capturedTransactions.concat(tr)
@@ -92,31 +107,109 @@ function apply (tr, prevPluginState) {
 }
 
 /**
- * Build the delta that should be applied for a group of captured PM transactions.
- *
- * @param {Array<import('prosemirror-state').Transaction>} captured
+ * @param {Y.Type} ytype
+ * @returns {string}
  */
-const capturedTransactionsToDelta = captured => {
-  const transform = new Transform(captured[0].before)
-  let stepFailed = false
+const getRootTypeKey = ytype => {
+  const key = Y.findRootTypeKey(ytype)
+  if (key == null) {
+    throw new Error('[y/prosemirror]: could not determine root shared type key')
+  }
+  return key
+}
 
-  for (let i = 0; i < captured.length; i++) {
-    for (let j = 0; j < captured[i].steps.length; j++) {
-      const success = transform.maybeStep(captured[i].steps[j])
-      if (success.failed) {
-        stepFailed = true
-        break
-      }
+/**
+ * @param {Y.Doc} doc
+ * @param {string} rootTypeKey
+ * @param {Y.Type} ytype
+ * @returns {Y.Doc}
+ */
+const ensureRootTypeInDoc = (doc, rootTypeKey, ytype) => {
+  doc.get(rootTypeKey, ytype.name ?? null)
+  return doc
+}
+
+/**
+ * @param {Y.Type} ytype
+ * @param {string} rootTypeKey
+ * @returns {Y.Doc}
+ */
+const cloneShadowDocFromYType = (ytype, rootTypeKey) => {
+  const doc = Y.cloneDoc(ytype.doc, {
+    isSuggestionDoc: ytype.doc?.isSuggestionDoc ?? false
+  })
+  return ensureRootTypeInDoc(doc, rootTypeKey, ytype)
+}
+
+/**
+ * @param {import('prosemirror-model').Node} pdoc
+ * @param {Y.Type} ytype
+ * @param {string} rootTypeKey
+ * @returns {Y.Doc}
+ */
+const createShadowDocFromPmDoc = (pdoc, ytype, rootTypeKey) => {
+  const doc = new Y.Doc({
+    isSuggestionDoc: ytype.doc?.isSuggestionDoc ?? false
+  })
+  const shadowType = doc.get(rootTypeKey, ytype.name ?? null)
+  pmToFragment(pdoc, shadowType, { attributionManager: Y.noAttributionsManager })
+  return doc
+}
+
+/**
+ * @param {any} docDelta
+ * @param {string} rootTypeKey
+ * @param {string|null|undefined} rootTypeName
+ */
+const extractRootTypeDelta = (docDelta, rootTypeKey, rootTypeName) => {
+  const rootOp = docDelta.attrs?.[rootTypeKey]
+  if (rootOp == null) {
+    return delta.create(rootTypeName ?? null).done()
+  }
+  if (rootOp.value == null) {
+    throw new Error('[y/prosemirror]: root shared type diff is not a modify operation')
+  }
+  return rootOp.value.done ? rootOp.value.done() : rootOp.value
+}
+
+/**
+ * @param {any} d
+ */
+const deltaHasChanges = d => {
+  const json = d?.toJSON && typeof d.toJSON === 'function' ? d.toJSON() : d
+  const hasChangesInJson = node => {
+    if (node == null || typeof node !== 'object') {
+      return false
     }
-    if (stepFailed) break
+    if (node.attrs && Object.keys(node.attrs).length > 0) {
+      return true
+    }
+    if (!Array.isArray(node.children)) {
+      return false
+    }
+    return node.children.some(child => {
+      if (child == null || typeof child !== 'object') {
+        return false
+      }
+      if (child.type === 'insert' || child.type === 'text') {
+        return true
+      }
+      if (child.delete != null || child.type === 'delete') {
+        return true
+      }
+      if (child.type === 'retain') {
+        return child.format != null && Object.keys(child.format).length > 0
+      }
+      if (child.type === 'modify') {
+        if (child.format != null && Object.keys(child.format).length > 0) {
+          return true
+        }
+        return hasChangesInJson(child.value)
+      }
+      return true
+    })
   }
-
-  if (stepFailed) {
-    console.error('[y/prosemirror]: step failed to apply, falling back to a full diff')
-    return docDiffToDelta(captured[0].before, captured[captured.length - 1].after)
-  }
-
-  return trToDelta(transform)
+  return hasChangesInJson(json)
 }
 
 /**
@@ -180,9 +273,12 @@ export function syncPlugin (ytype, {
   onFirstRender = () => {}
 } = {}) {
   const mutex = mux.createMutex()
+  const rootTypeKey = getRootTypeKey(ytype)
   // Store the current subscription unsubscribe function
   /** @type {(() => void) | null} */
   let unsubscribeFn = null
+  /** @type {Y.Doc | null} */
+  let shadowDoc = null
 
   /**
    * Subscribe to ytype changes and apply remote updates to prosemirror
@@ -224,7 +320,7 @@ export function syncPlugin (ytype, {
       }
 
       mutex(() => {
-        let d
+        const nextShadowDoc = cloneShadowDocFromYType(ytype, rootTypeKey)
         if (!isYTypeInitialized) {
           // First remote update before init completed: diff the full Y.Type
           // content against the current PM doc, not the incremental event delta
@@ -234,38 +330,54 @@ export function syncPlugin (ytype, {
             ytype.toDelta(attributionManager, { deep: true }),
             mapAttributionToMark
           ).done()
-          d = delta.diff(nodeToDelta(view.state.doc).done(), ytypeContent)
+          const d = delta.diff(nodeToDelta(view.state.doc).done(), ytypeContent)
+          const ptr = deltaToPSteps(view.state.tr, d)
+
+          ptr.setMeta(ySyncPluginKey, {
+            type: 'remote-update',
+            change,
+            ytype
+          })
+          ptr.setMeta('addToHistory', false)
+          if (ptr.steps.length > 0) {
+            view.dispatch(ptr)
+          }
         } else {
-          d = deltaAttributionToFormat(
-            change.getDelta(attributionManager, { deep: true }),
-            mapAttributionToMark
-          ).done()
+          shadowDoc = shadowDoc ?? createShadowDocFromPmDoc(view.state.doc, ytype, rootTypeKey)
+          const docDelta = Y.diffDocsToDelta(shadowDoc, nextShadowDoc, {
+            am: attributionManager
+          }).done()
+          const rootDelta = extractRootTypeDelta(docDelta, rootTypeKey, ytype.name)
+          const d = deltaAttributionToFormat(rootDelta, mapAttributionToMark).done()
+          console.log('remote hydrate', {
+            prevBlocks: shadowDoc.get(rootTypeKey, ytype.name ?? null).toArray()[0]?.toArray().length ?? null,
+            nextBlocks: nextShadowDoc.get(rootTypeKey, ytype.name ?? null).toArray()[0]?.toArray().length ?? null,
+            pmBlocks: view.state.doc.firstChild?.childCount ?? null,
+            hasChanges: deltaHasChanges(d),
+            delta: JSON.stringify(d.toJSON ? d.toJSON() : d)
+          })
+          if (deltaHasChanges(d)) {
+            const ptr = deltaToPSteps(view.state.tr, d)
+            console.log('remote hydrate steps', {
+              stepCount: ptr.steps.length,
+              steps: JSON.stringify(ptr.steps.map(step => ({
+                type: step.constructor.name,
+                json: step.toJSON()
+              })))
+            })
+            ptr.setMeta(ySyncPluginKey, {
+              type: 'remote-update',
+              change,
+              ytype
+            })
+            ptr.setMeta('addToHistory', false)
+            if (ptr.steps.length > 0) {
+              view.dispatch(ptr)
+            }
+          }
         }
 
-        let ptr = deltaToPSteps(view.state.tr, d)
-
-        // DiffAttributionManager.contentLength returns 0 for deleted items
-        // without suggestion attrs, making the incremental event delta blind
-        // to deletions propagated from the base doc (e.g. undo via applyUpdate).
-        // For non-local transactions with an attribution manager, fall back to
-        // a full doc diff which compares rendered content directly.
-        if (ptr.steps.length === 0 && isYTypeInitialized && !tr.local && attributionManager !== Y.noAttributionsManager) {
-          const ytypeContent = deltaAttributionToFormat(
-            ytype.toDelta(attributionManager, { deep: true }),
-            mapAttributionToMark
-          ).done()
-          const fullDiff = delta.diff(nodeToDelta(view.state.doc).done(), ytypeContent)
-          ptr = deltaToPSteps(view.state.tr, fullDiff)
-        }
-
-        ptr.setMeta(ySyncPluginKey, {
-          type: 'remote-update',
-          change,
-          ytype
-        })
-        ptr.setMeta('addToHistory', false)
-        view.dispatch(ptr)
-
+        shadowDoc = nextShadowDoc
         isYTypeInitialized = true
       })
     })
@@ -352,6 +464,8 @@ export function syncPlugin (ytype, {
           view.dispatch(tr)
         }
 
+        shadowDoc = cloneShadowDocFromYType(ytype, rootTypeKey)
+
         // Call onFirstRender callback
         onFirstRender()
 
@@ -392,6 +506,7 @@ export function syncPlugin (ytype, {
                 attributionManager: pluginState.attributionManager,
                 mapAttributionToMark
               })
+              shadowDoc = cloneShadowDocFromYType(pluginState.ytype, rootTypeKey)
             }
 
             // Process captured transactions and apply to ytype
@@ -410,11 +525,14 @@ export function syncPlugin (ytype, {
                       attributionManager: pluginState.attributionManager
                     })
                   }, ySyncPluginKey)
+                  shadowDoc = createShadowDocFromPmDoc(
+                    prevState.doc,
+                    pluginState.ytype,
+                    rootTypeKey
+                  )
                 }
 
                 capturedGroups.forEach(({ captured, addToHistory }) => {
-                  const deltaToApply = capturedTransactionsToDelta(captured)
-
                   // Transactions that originated from remote Y.Doc updates
                   // (observeDeep -> PM dispatch) should remain non-local when
                   // written back to the Y.Doc so the UndoManager does not
@@ -422,11 +540,19 @@ export function syncPlugin (ytype, {
                   const isLocal = !captured.some(
                     pmTr => pmTr.getMeta(ySyncPluginKey)?.type === 'remote-update'
                   )
+                  shadowDoc = shadowDoc ?? createShadowDocFromPmDoc(captured[0].before, pluginState.ytype, rootTypeKey)
 
                   Y.transact(pluginState.ytype.doc, (tr) => {
                     tr.meta.set('addToHistory', addToHistory)
-                    pluginState.ytype.applyDelta(deltaToApply, pluginState.attributionManager)
+                    syncStructuralChangesToYFragment(
+                      pluginState.ytype,
+                      captured[0].before,
+                      captured[captured.length - 1].doc,
+                      { attributionManager: pluginState.attributionManager }
+                    )
                   }, ySyncPluginKey, isLocal)
+
+                  shadowDoc = cloneShadowDocFromYType(pluginState.ytype, rootTypeKey)
                 })
 
                 pluginState.capturedTransactions = []
