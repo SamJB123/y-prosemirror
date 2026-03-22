@@ -106,130 +106,6 @@ function apply (tr, prevPluginState) {
   return prevPluginState
 }
 
-/**
- * @typedef {{ rootTypeKey: string, rootTypeName: string | null | undefined, path: Array<string|number> }} TypeLocator
- */
-
-/**
- * @param {Y.Type} ytype
- * @returns {TypeLocator}
- */
-const getTypeLocator = ytype => {
-  let rootType = ytype
-  while (rootType._item !== null) {
-    rootType = /** @type {Y.Type} */ (rootType._item.parent)
-  }
-  const rootTypeKey = Y.findRootTypeKey(rootType)
-  return {
-    rootTypeKey,
-    rootTypeName: rootType.name,
-    path: rootType === ytype ? [] : Y.getPathTo(rootType, ytype)
-  }
-}
-
-/**
- * @param {Y.Doc} doc
- * @param {TypeLocator} typeLocator
- * @returns {Y.Type}
- */
-const resolveTypeInDoc = (doc, typeLocator) => {
-  /** @type {any} */
-  let type = doc.get(typeLocator.rootTypeKey, typeLocator.rootTypeName ?? null)
-  typeLocator.path.forEach(segment => {
-    type = typeof segment === 'number' ? type.get(segment) : type.getAttr(segment)
-  })
-  return type
-}
-
-/**
- * @param {Y.Type} ytype
- * @param {TypeLocator} typeLocator
- * @returns {Y.Doc}
- */
-const cloneShadowDocFromYType = (ytype, typeLocator) => {
-  const doc = Y.cloneDoc(ytype.doc, {
-    isSuggestionDoc: ytype.doc?.isSuggestionDoc ?? false
-  })
-  resolveTypeInDoc(doc, typeLocator)
-  return doc
-}
-
-/**
- * @param {import('prosemirror-model').Node} pdoc
- * @param {TypeLocator} typeLocator
- * @returns {Y.Doc}
- */
-const createShadowDocFromPmDoc = (pdoc, typeLocator) => {
-  const doc = new Y.Doc({
-    isSuggestionDoc: false
-  })
-  const shadowType = doc.get(typeLocator.rootTypeKey, typeLocator.rootTypeName ?? null)
-  let currentType = shadowType
-  typeLocator.path.forEach(segment => {
-    const childType = new Y.Type()
-    if (typeof segment === 'number') {
-      while (currentType.length < segment) {
-        currentType.insert(currentType.length, [new Y.Type()])
-      }
-      if (currentType.length === segment) {
-        currentType.insert(segment, [childType])
-      }
-      currentType = /** @type {Y.Type} */ (currentType.get(segment))
-    } else {
-      currentType.setAttr(segment, childType)
-      currentType = /** @type {Y.Type} */ (currentType.getAttr(segment))
-    }
-  })
-  pmToFragment(pdoc, currentType, { attributionManager: Y.noAttributionsManager })
-  return doc
-}
-
-/**
- * @param {any} docDelta
- * @param {TypeLocator} typeLocator
- */
-const extractTypeDelta = (docDelta, typeLocator) => {
-  const rootOp = docDelta.attrs?.[typeLocator.rootTypeKey]
-  if (rootOp == null) {
-    return delta.create(typeLocator.rootTypeName ?? null).done()
-  }
-  if (rootOp.value == null) {
-    throw new Error('[y/prosemirror]: root shared type diff is not a modify operation')
-  }
-  let currentDelta = rootOp.value.done ? rootOp.value.done() : rootOp.value
-  typeLocator.path.forEach(segment => {
-    if (typeof segment === 'number') {
-      let childIndex = 0
-      let nextDelta = null
-      for (const child of currentDelta.children ?? []) {
-        if (child?.type === 'retain') {
-          childIndex += child.retain
-          continue
-        }
-        if (child?.type === 'modify') {
-          if (childIndex === segment) {
-            nextDelta = child.value.done ? child.value.done() : child.value
-            break
-          }
-          childIndex += 1
-          continue
-        }
-        if (child?.type === 'delete') {
-          childIndex += child.delete
-          continue
-        }
-        if (child?.type === 'insert') {
-          childIndex += Array.isArray(child.insert) ? child.insert.length : 1
-        }
-      }
-      currentDelta = nextDelta ?? delta.create().done()
-      return
-    }
-    const attrOp = currentDelta.attrs?.[segment]
-    currentDelta = attrOp?.value?.done ? attrOp.value.done() : (attrOp?.value ?? delta.create().done())
-  })
-  return currentDelta
-}
 
 /**
  * @param {any} d
@@ -368,12 +244,11 @@ export function syncPlugin (ytype, {
   onFirstRender = () => {}
 } = {}) {
   const mutex = mux.createMutex()
-  const typeLocator = getTypeLocator(ytype)
   // Store the current subscription unsubscribe function
   /** @type {(() => void) | null} */
   let unsubscribeFn = null
-  /** @type {Y.Doc | null} */
-  let shadowDoc = null
+  /** @type {any} */
+  let shadowDelta = null
 
   /**
    * Subscribe to ytype changes and apply remote updates to prosemirror
@@ -415,17 +290,17 @@ export function syncPlugin (ytype, {
       }
 
       mutex(() => {
-        const nextShadowDoc = cloneShadowDocFromYType(ytype, typeLocator)
+        const nextDelta = deltaAttributionToFormat(
+          ytype.toDelta(attributionManager, { deep: true }),
+          mapAttributionToMark
+        ).done()
+
         if (!isYTypeInitialized) {
           // First remote update before init completed: diff the full Y.Type
           // content against the current PM doc, not the incremental event delta
           // (event deltas contain ModifyOps which are structurally incompatible
           // with the full-doc InsertOps that nodeToDelta produces).
-          const ytypeContent = deltaAttributionToFormat(
-            ytype.toDelta(attributionManager, { deep: true }),
-            mapAttributionToMark
-          ).done()
-          const d = delta.diff(nodeToDelta(view.state.doc).done(), ytypeContent)
+          const d = delta.diff(nodeToDelta(view.state.doc).done(), nextDelta)
           const ptr = deltaToPSteps(view.state.tr, d)
 
           ptr.setMeta(ySyncPluginKey, {
@@ -438,12 +313,8 @@ export function syncPlugin (ytype, {
             view.dispatch(ptr)
           }
         } else {
-          shadowDoc = shadowDoc ?? createShadowDocFromPmDoc(view.state.doc, typeLocator)
-          const docDelta = Y.diffDocsToDelta(shadowDoc, nextShadowDoc, {
-            am: attributionManager
-          }).done()
-          const rootDelta = extractTypeDelta(docDelta, typeLocator)
-          const d = deltaAttributionToFormat(rootDelta, mapAttributionToMark).done()
+          shadowDelta = shadowDelta ?? nodeToDelta(view.state.doc).done()
+          const d = delta.diff(shadowDelta, nextDelta)
           if (deltaHasChanges(d)) {
             let ptr
             if (shouldHydrateViaFullFragmentDiff(d)) {
@@ -466,7 +337,7 @@ export function syncPlugin (ytype, {
           }
         }
 
-        shadowDoc = nextShadowDoc
+        shadowDelta = nextDelta
         isYTypeInitialized = true
       })
     })
@@ -564,7 +435,10 @@ export function syncPlugin (ytype, {
           view.dispatch(tr)
         }
 
-        shadowDoc = cloneShadowDocFromYType(ytype, typeLocator)
+        shadowDelta = deltaAttributionToFormat(
+          ytype.toDelta(attributionManager, { deep: true }),
+          mapAttributionToMark
+        ).done()
 
         // Call onFirstRender callback
         onFirstRender()
@@ -606,7 +480,10 @@ export function syncPlugin (ytype, {
                 attributionManager: pluginState.attributionManager,
                 mapAttributionToMark
               })
-              shadowDoc = cloneShadowDocFromYType(pluginState.ytype, typeLocator)
+              shadowDelta = deltaAttributionToFormat(
+                pluginState.ytype.toDelta(pluginState.attributionManager, { deep: true }),
+                mapAttributionToMark
+              ).done()
             }
 
             // Process captured transactions and apply to ytype
@@ -625,7 +502,7 @@ export function syncPlugin (ytype, {
                       attributionManager: pluginState.attributionManager
                     })
                   }, ySyncPluginKey)
-                  shadowDoc = createShadowDocFromPmDoc(prevState.doc, typeLocator)
+                  shadowDelta = nodeToDelta(prevState.doc).done()
                 }
 
                 for (let groupIndex = 0; groupIndex < capturedGroups.length; groupIndex++) {
@@ -644,7 +521,7 @@ export function syncPlugin (ytype, {
                   const isLocal = !captured.some(
                     pmTr => pmTr.getMeta(ySyncPluginKey)?.type === 'remote-update'
                   )
-                  shadowDoc = shadowDoc ?? createShadowDocFromPmDoc(captured[0].before, typeLocator)
+                  shadowDelta = shadowDelta ?? nodeToDelta(captured[0].before).done()
                   const targetDoc = shouldMergeNextUniqueIdGroup
                     ? nextGroup.captured[nextGroup.captured.length - 1].doc
                     : captured[captured.length - 1].doc
@@ -659,7 +536,10 @@ export function syncPlugin (ytype, {
                     )
                   }, ySyncPluginKey, isLocal)
 
-                  shadowDoc = cloneShadowDocFromYType(pluginState.ytype, typeLocator)
+                  shadowDelta = deltaAttributionToFormat(
+                    pluginState.ytype.toDelta(pluginState.attributionManager, { deep: true }),
+                    mapAttributionToMark
+                  ).done()
                   if (shouldMergeNextUniqueIdGroup) {
                     groupIndex++
                   }
